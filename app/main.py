@@ -37,6 +37,7 @@ from .schemas import (
     SegmentationOut,
     TimelineOut,
 )
+from .propagation import PropagationValidationError
 from .segmentation import Sample, segment_samples
 from .timeline import ForcedPointsOverflow
 
@@ -679,10 +680,17 @@ def get_propagation(
     start: dt.datetime = Query(..., description="起始时间（含），ISO8601"),
     end: dt.datetime = Query(..., description="结束时间（含），ISO8601"),
     step_seconds: float = Query(
-        ..., gt=0.0, description="固定插值网格步长（秒，必须为正）"
+        ...,
+        gt=0.0,
+        description=(
+            "固定插值网格步长（秒，必须为正）；统一到微秒精度，小于 0.5 微秒"
+            "的正步长取整为零，返回 422"
+        ),
     ),
     max_lag_seconds: float = Query(
-        ..., ge=0.0, description="枚举时滞的最大绝对值（秒，非负）；正时滞表示 source 领先 target"
+        ...,
+        ge=0.0,
+        description="枚举时滞的最大绝对值（秒，非负）；正时滞表示 source 领先 target",
     ),
     max_gap_seconds: float = Query(
         ..., gt=0.0, description="允许的最大相邻读数间隔（秒）；超过则该插值点无效"
@@ -702,17 +710,23 @@ def get_propagation(
     if not services._case_has_readings(db, target_sn):
         raise HTTPException(status_code=404, detail=f"展柜不存在或尚无读数: {target_sn}")
 
-    return services.build_propagation(
-        db,
-        source_sn=source_sn,
-        target_sn=target_sn,
-        dimension=dimension,
-        start=start_utc,
-        end=end_utc,
-        step_seconds=step_seconds,
-        max_lag_seconds=max_lag_seconds,
-        max_gap_seconds=max_gap_seconds,
-    )
+    try:
+        return services.build_propagation(
+            db,
+            source_sn=source_sn,
+            target_sn=target_sn,
+            dimension=dimension,
+            start=start_utc,
+            end=end_utc,
+            step_seconds=step_seconds,
+            max_lag_seconds=max_lag_seconds,
+            max_gap_seconds=max_gap_seconds,
+        )
+    except PropagationValidationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"message": str(exc), **exc.context},
+        )
 
 
 # ---------- 展柜同伴基线偏离 ----------

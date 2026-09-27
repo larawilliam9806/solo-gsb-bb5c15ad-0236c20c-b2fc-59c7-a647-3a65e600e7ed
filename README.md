@@ -215,13 +215,14 @@ new_mean = (old_mean × report_count + value) / (report_count + 1)
 展柜传播而来、领先多少秒：
 
 1. 分析时段取查询窗 `[start, end]` 与两柜读数覆盖范围的**交集**；
-2. 在重叠时段上按 `step_seconds` 生成**等距网格**（从重叠起点起，不足
-   一个步长的尾部不补点），两柜曲线各自在网格点上按相邻读数**线性
-   插值**；
+2. `step_seconds` **统一到微秒精度**（四舍五入取整为整数微秒），在重叠
+   时段上按**生效步长**生成**等距网格**（从重叠起点起，不足一个步长的
+   尾部不补点），两柜曲线各自在网格点上按相邻读数**线性插值**；网格、
+   各档时滞秒数与响应回显的 `step_seconds` 均为同一**生效步长**；
 3. 网格点所依赖的相邻读数间隔**大于** `max_gap_seconds` 时该点判为
    **无效**（恰好等于 `max_gap` 仍连续）；落在某柜覆盖范围外的点同样
    无效；
-4. 时滞按 `step_seconds` 的整数倍枚举，范围
+4. 时滞按**生效步长**的整数倍枚举，范围
    `[-max_lag_seconds, +max_lag_seconds]`（含 0）。**正时滞表示 source
    领先 target**：比较 source 在 `t` 与 target 在 `t + lag` 的插值；
 5. 每个时滞只使用两侧**同时有效的成对点**计算皮尔逊相关：成对点数少于
@@ -229,6 +230,15 @@ new_mean = (old_mean × report_count + value) / (report_count + 1)
    `correlation` 为 `null` 并给出 `reason`
    （`no_overlap` / `insufficient_samples` / `constant_series`），
    **任何情况下都不产生 NaN**。
+
+为避免无界生成网格与时滞明细，**分配任何网格之前**先用生效步长预估三项
+规模（**边界值可计算**，恰好等于上限放行）：
+
+| 规模项 | 上限 | 含义 |
+| --- | --- | --- |
+| 重叠网格点数 | `10000` | `⌊重叠时长 / 生效步长⌋ + 1`（含两端边界） |
+| 时滞明细行数 | `201` | `2·⌊max_lag_seconds / 生效步长⌋ + 1`（含零时滞） |
+| 配对工作量 | `1000000` | 全部时滞的重叠网格点配对数之和，即 `n·(2kmax+1) − kmax·(kmax+1)`（`kmax < n` 时；否则为 `n²`） |
 
 各时滞明细 `lags` 按时滞升序返回。最佳时滞按以下次序**依次择优**：
 
@@ -243,7 +253,11 @@ new_mean = (old_mean × report_count + value) / (report_count + 1)
 
 `source_sn` 与 `target_sn` 相同、`start` 晚于 `end`、`step_seconds ≤ 0`、
 `max_lag_seconds < 0`、`max_gap_seconds ≤ 0`、维度非法均返回 `422`；
-任一展柜没有读数返回 `404`；两柜无重叠或全部时滞不可用时返回 `200` 与
+`step_seconds` / `max_lag_seconds` / `max_gap_seconds` 为 **NaN 或
+Infinity 等非有限值**、或正步长按微秒取整后为 **0**（最小生效步长
+1 微秒）同样返回 `422`；预计算的重叠网格点数、时滞明细行数或配对工作量
+超过上表上限也返回 `422`（响应体给出实际值与上限）；任一展柜没有读数
+返回 `404`；两柜无重叠或全部时滞不可用时返回 `200` 与
 `direction=unavailable`。接口**只读**，不写库、不改版本号。
 
 ### 11. 冷凝风险
@@ -925,9 +939,10 @@ curl 'http://localhost:8080/api/v1/propagation?source_sn=CASE-A&target_sn=CASE-B
 | `source_sn` / `target_sn` | 是 | 源 / 目标展柜序号；二者相同返回 `422`，任一无读数返回 `404` |
 | `dimension` | 是 | `temperature` 或 `humidity` |
 | `start` / `end` | 是 | 含端点的 ISO8601 时间窗；实际网格取它与两柜覆盖范围的交集 |
-| `step_seconds` | 是 | 固定插值网格步长（秒，**> 0**）；时滞按其整数倍枚举 |
-| `max_lag_seconds` | 是 | 枚举时滞的最大绝对值（秒，**≥ 0**）；正时滞表示 source 领先 target |
+| `step_seconds` | 是 | 固定插值网格步长（秒，**> 0**），统一到**微秒精度**；取整为 0 返回 `422`，响应回显生效步长。重叠网格点数上限 `10000` |
+| `max_lag_seconds` | 是 | 枚举时滞的最大绝对值（秒，**≥ 0**）；正时滞表示 source 领先 target。时滞行数上限 `201`，即 `⌊max_lag / 生效步长⌋ ≤ 100` |
 | `max_gap_seconds` | 是 | 允许的最大相邻读数间隔（秒，**> 0**）；超过则该插值点无效 |
+| 规模上限 | — | 分配前预估：重叠网格点数 ≤ `10000`、时滞行数 ≤ `201`、全部时滞配对工作量 ≤ `1000000`（边界值可计算，超限 `422`） |
 
 响应示例（target 的温度曲线整体落后 source 2 分钟，最佳时滞 `+120s`，
 方向 `source_to_target`）：
