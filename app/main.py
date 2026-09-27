@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 from . import services
 from .database import CaseState, SessionLocal, init_db, to_utc
 from .excursions import Thresholds
+from .propagation import PropagationParamsError, normalize_time_params
 from .recovery import InsufficientBaselineSamples
 from .schemas import (
     AnchorIn,
@@ -94,6 +95,17 @@ def get_db():
 
 def _parse_ts(value: dt.datetime | None) -> dt.datetime | None:
     return to_utc(value) if value is not None else None
+
+
+def _propagation_params_422(exc: PropagationParamsError) -> HTTPException:
+    detail: dict[str, object] = {"message": str(exc), "parameter": exc.parameter}
+    if exc.limit is not None:
+        detail["limit"] = exc.limit
+    if exc.actual is not None:
+        detail["actual"] = exc.actual
+    return HTTPException(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=detail
+    )
 
 
 @app.get("/", include_in_schema=False)
@@ -679,13 +691,25 @@ def get_propagation(
     start: dt.datetime = Query(..., description="起始时间（含），ISO8601"),
     end: dt.datetime = Query(..., description="结束时间（含），ISO8601"),
     step_seconds: float = Query(
-        ..., gt=0.0, description="固定插值网格步长（秒，必须为正）"
+        ...,
+        gt=0.0,
+        description=(
+            "固定插值网格步长（秒，必须为正且有限）；按微秒四舍五入取整为生效步长，"
+            "取整后为 0 返回 422；重叠网格点数超过 10000 或配对工作量超过 1000000 返回 422"
+        ),
     ),
     max_lag_seconds: float = Query(
-        ..., ge=0.0, description="枚举时滞的最大绝对值（秒，非负）；正时滞表示 source 领先 target"
+        ...,
+        ge=0.0,
+        description=(
+            "枚举时滞的最大绝对值（秒，非负且有限）；正时滞表示 source 领先 target；"
+            "枚举时滞行数（2⌊max_lag/step⌋+1）超过 201 返回 422"
+        ),
     ),
     max_gap_seconds: float = Query(
-        ..., gt=0.0, description="允许的最大相邻读数间隔（秒）；超过则该插值点无效"
+        ...,
+        gt=0.0,
+        description="允许的最大相邻读数间隔（秒，必须为正且有限）；超过则该插值点无效",
     ),
     db: Session = Depends(get_db),
 ):
@@ -697,22 +721,31 @@ def get_propagation(
     if start_utc > end_utc:
         raise HTTPException(status_code=422, detail="start 不能晚于 end")
 
+    # 时间参数校验先于数据查询：非有限值 / 亚微秒步长 / 规模超限一律 422（404 不前置）
+    try:
+        normalize_time_params(step_seconds, max_lag_seconds, max_gap_seconds)
+    except PropagationParamsError as exc:
+        raise _propagation_params_422(exc)
+
     if not services._case_has_readings(db, source_sn):
         raise HTTPException(status_code=404, detail=f"展柜不存在或尚无读数: {source_sn}")
     if not services._case_has_readings(db, target_sn):
         raise HTTPException(status_code=404, detail=f"展柜不存在或尚无读数: {target_sn}")
 
-    return services.build_propagation(
-        db,
-        source_sn=source_sn,
-        target_sn=target_sn,
-        dimension=dimension,
-        start=start_utc,
-        end=end_utc,
-        step_seconds=step_seconds,
-        max_lag_seconds=max_lag_seconds,
-        max_gap_seconds=max_gap_seconds,
-    )
+    try:
+        return services.build_propagation(
+            db,
+            source_sn=source_sn,
+            target_sn=target_sn,
+            dimension=dimension,
+            start=start_utc,
+            end=end_utc,
+            step_seconds=step_seconds,
+            max_lag_seconds=max_lag_seconds,
+            max_gap_seconds=max_gap_seconds,
+        )
+    except PropagationParamsError as exc:
+        raise _propagation_params_422(exc)
 
 
 # ---------- 展柜同伴基线偏离 ----------

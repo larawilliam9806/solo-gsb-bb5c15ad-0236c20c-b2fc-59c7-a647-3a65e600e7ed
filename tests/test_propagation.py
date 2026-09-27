@@ -15,10 +15,14 @@ from fastapi.testclient import TestClient
 from app.database import Base, engine, init_db
 from app.main import app
 from app.propagation import (
+    MAX_GRID_POINTS,
+    MAX_LAG_ROWS,
+    MAX_PAIR_WORK,
     REASON_CONSTANT,
     REASON_INSUFFICIENT,
     REASON_NO_OVERLAP,
     LagCorrelation,
+    PropagationParamsError,
     compute_propagation,
 )
 from app.segmentation import Sample
@@ -306,6 +310,152 @@ def test_unsorted_input_deterministic():
     assert r1.best_lag_seconds == r2.best_lag_seconds
 
 
+# ---------- 时间离散边界与资源上限（纯算法） ----------
+
+
+def _span_samples(span_seconds: float, base_t: float = 20.0):
+    """只在窗口两端各放一个读数的序列（配合大 max_gap 覆盖整段）。"""
+    return [
+        Sample(BASE, base_t, 50.0),
+        Sample(BASE + dt.timedelta(seconds=span_seconds), base_t + 1.0, 50.0),
+    ]
+
+
+def test_sub_microsecond_step_rounding_to_zero_rejected():
+    src = _wave_src()
+    # 小于半微秒的正步长取整为 0：拒绝（修复前会网格除零）
+    with pytest.raises(PropagationParamsError) as ei:
+        _compute(src, src, step=0.0000001)
+    assert ei.value.parameter == "step_seconds"
+    # 恰好半微秒：round-half-even 取整为 0 → 同样拒绝
+    with pytest.raises(PropagationParamsError):
+        _compute(src, src, step=0.0000005)
+    # 非正步长直调纯算法同样拒绝（接口层由 pydantic 拦）
+    with pytest.raises(PropagationParamsError):
+        _compute(src, src, step=0.0)
+    with pytest.raises(PropagationParamsError):
+        _compute(src, src, step=-1.0)
+
+
+def test_non_finite_time_params_rejected():
+    src = _wave_src()
+    for bad in (math.inf, -math.inf, math.nan):
+        with pytest.raises(PropagationParamsError):
+            _compute(src, src, step=bad)
+        with pytest.raises(PropagationParamsError):
+            _compute(src, src, max_lag=bad)
+        with pytest.raises(PropagationParamsError):
+            _compute(src, src, max_gap=bad)
+
+
+def test_step_quantized_to_microseconds_and_echoed():
+    # 60.0000004 秒取整为整 60 秒：回显、网格、时滞都按生效步长
+    res = _compute(_wave_src(), _wave_src(), step=60.0000004, max_lag=120.0)
+    assert res.step_seconds == 60.0
+    assert res.grid_point_count == 12  # 重叠 [0, 11min]，与 step=60 完全一致
+    assert [l.lag_seconds for l in res.lags] == [-120.0, -60.0, 0.0, 60.0, 120.0]
+
+    # 1.5 微秒取整为 2 微秒（4µs 跨度 → 0/2/4µs 三点）
+    tiny = [
+        Sample(BASE, 20.0, 50.0),
+        Sample(BASE + dt.timedelta(microseconds=4), 24.0, 50.0),
+    ]
+    tiny_res = compute_propagation(
+        tiny, tiny, "temperature",
+        start=BASE, end=BASE + dt.timedelta(microseconds=4),
+        step_seconds=0.0000015, max_lag_seconds=0.0, max_gap_seconds=600.0,
+    )
+    assert tiny_res.step_seconds == pytest.approx(0.000002)
+    assert tiny_res.grid_point_count == 3
+    assert tiny_res.lags[0].lag_seconds == 0.0
+
+
+def test_lag_seconds_are_exact_multiples_of_effective_step():
+    # 取整前带微秒零头；时滞秒数不得带出浮点漂移
+    res = _compute(_wave_src(), _wave_src(), step=60.0000004, max_lag=300.0)
+    assert [l.lag_seconds for l in res.lags] == [
+        -300.0, -240.0, -180.0, -120.0, -60.0,
+        0.0, 60.0, 120.0, 180.0, 240.0, 300.0,
+    ]
+
+
+def test_grid_point_limit_boundary_values():
+    # 恰好 MAX_GRID_POINTS 个网格点：可计算
+    res = _compute(
+        _span_samples(9999.0), _span_samples(9999.0),
+        end=BASE + dt.timedelta(seconds=9999.0),
+        step=1.0, max_lag=0.0, max_gap=20000.0,
+    )
+    assert res.grid_point_count == MAX_GRID_POINTS == 10000
+
+    # 再多一个点：分配前拒绝
+    with pytest.raises(PropagationParamsError) as ei:
+        _compute(
+            _span_samples(10000.0), _span_samples(10000.0),
+            end=BASE + dt.timedelta(seconds=10000.0),
+            step=1.0, max_lag=0.0, max_gap=20000.0,
+        )
+    assert ei.value.parameter == "grid_point_count"
+    assert (ei.value.limit, ei.value.actual) == (10000, 10001)
+
+
+def test_lag_row_limit_boundary_values():
+    end = BASE + dt.timedelta(seconds=660)
+    # 2*100+1 = 201 行：可计算
+    res = _compute(_wave_src(), _wave_src(), end=end, step=1.0, max_lag=100.0)
+    assert len(res.lags) == MAX_LAG_ROWS == 201
+
+    # 203 行：拒绝
+    with pytest.raises(PropagationParamsError) as ei:
+        _compute(_wave_src(), _wave_src(), end=end, step=1.0, max_lag=101.0)
+    assert ei.value.parameter == "lag_row_count"
+    assert (ei.value.limit, ei.value.actual) == (201, 203)
+
+
+def test_lag_row_limit_applies_even_without_overlap():
+    # 无重叠时仍会枚举全部时滞明细：大时滞同样受 201 行上限保护
+    far = [_sample(60, 1.0), _sample(61, 2.0)]
+    with pytest.raises(PropagationParamsError) as ei:
+        _compute(_wave_src(), far, step=1.0, max_lag=101.0)
+    assert ei.value.parameter == "lag_row_count"
+
+
+def test_pair_work_limit_boundary_values():
+    # 8000 网格点 × 125 时滞行 = 1,000,000：恰好等于上限，可计算
+    res = _compute(
+        _span_samples(7999.0), _span_samples(7999.0),
+        end=BASE + dt.timedelta(seconds=7999.0),
+        step=1.0, max_lag=62.0, max_gap=20000.0,
+    )
+    assert res.grid_point_count == 8000
+    assert len(res.lags) == 125
+    assert 8000 * 125 == MAX_PAIR_WORK == 1_000_000
+
+    # 8001 × 125 = 1,000,125 > 上限：分配前拒绝（网格点数本身未超 10000）
+    with pytest.raises(PropagationParamsError) as ei:
+        _compute(
+            _span_samples(8000.0), _span_samples(8000.0),
+            end=BASE + dt.timedelta(seconds=8000.0),
+            step=1.0, max_lag=62.0, max_gap=20000.0,
+        )
+    assert ei.value.parameter == "pair_work"
+    assert (ei.value.limit, ei.value.actual) == (1_000_000, 1_000_125)
+
+
+def test_limits_enforced_before_allocation_is_fast():
+    # 大窗口 × 小步长本会生成上亿网格点：必须在校验阶段立即失败
+    import time
+
+    t0 = time.perf_counter()
+    with pytest.raises(PropagationParamsError):
+        _compute(
+            _span_samples(100_000.0), _span_samples(100_000.0),
+            end=BASE + dt.timedelta(seconds=100_000.0),
+            step=0.001, max_lag=0.0, max_gap=200_000.0,
+        )
+    assert time.perf_counter() - t0 < 1.0
+
+
 # ---------- 接口集成 ----------
 
 
@@ -485,3 +635,156 @@ def test_endpoint_deterministic(client):
     first = client.get("/api/v1/propagation", params=params).json()
     second = client.get("/api/v1/propagation", params=params).json()
     assert first == second
+
+
+# ---------- 接口集成：时间离散边界与资源上限 ----------
+
+
+def test_endpoint_rejects_sub_microsecond_step(client):
+    _ingest(client, "CASE-M1", _wave_readings("CASE-M1", 0))
+    _ingest(client, "CASE-M2", _wave_readings("CASE-M2", 0))
+    params = {
+        "source_sn": "CASE-M1", "target_sn": "CASE-M2", "dimension": "temperature",
+        **BASE_PARAMS, "step_seconds": 0.0000001,
+    }
+    r = client.get("/api/v1/propagation", params=params)
+    assert r.status_code == 422
+    detail = r.json()["detail"]
+    assert detail["parameter"] == "step_seconds"
+    assert "微秒" in detail["message"]
+
+
+def test_endpoint_time_param_validation_precedes_404(client):
+    # 未知展柜本应 404，但时间参数非法时先判 422
+    params = {
+        "source_sn": "CASE-GHOST1", "target_sn": "CASE-GHOST2",
+        "dimension": "temperature", **BASE_PARAMS, "step_seconds": 0.0000001,
+    }
+    assert client.get("/api/v1/propagation", params=params).status_code == 422
+
+
+def test_endpoint_rejects_non_finite_time_params(client):
+    _ingest(client, "CASE-N1", _wave_readings("CASE-N1", 0))
+    _ingest(client, "CASE-N2", _wave_readings("CASE-N2", 0))
+    base = {
+        "source_sn": "CASE-N1", "target_sn": "CASE-N2",
+        "dimension": "temperature", **BASE_PARAMS,
+    }
+    for key in ("step_seconds", "max_lag_seconds", "max_gap_seconds"):
+        for bad in ("inf", "-inf", "nan"):
+            r = client.get("/api/v1/propagation", params={**base, key: bad})
+            assert r.status_code == 422, (key, bad, r.text)
+    # 放行 pydantic 的 +inf 步长由接口层拒绝，且 detail 指明参数
+    r = client.get("/api/v1/propagation", params={**base, "step_seconds": "inf"})
+    assert r.status_code == 422
+    assert r.json()["detail"]["parameter"] == "step_seconds"
+
+
+def test_endpoint_effective_step_echo_and_grid(client):
+    _ingest(client, "CASE-E1", _wave_readings("CASE-E1", 0))
+    _ingest(client, "CASE-E2", _wave_readings("CASE-E2", 2))
+    r = client.get(
+        "/api/v1/propagation",
+        params={
+            **BASE_PARAMS, "source_sn": "CASE-E1", "target_sn": "CASE-E2",
+            "dimension": "temperature", "step_seconds": 60.0000004,
+        },
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    # 回显与各档时滞都使用取整后的生效步长 60s
+    assert body["step_seconds"] == 60.0
+    assert body["grid_point_count"] == 10
+    assert body["best_lag_seconds"] == 120.0
+    assert [l["lag_seconds"] for l in body["lags"]] == [
+        -300.0, -240.0, -180.0, -120.0, -60.0,
+        0.0, 60.0, 120.0, 180.0, 240.0, 300.0,
+    ]
+
+
+def test_endpoint_grid_point_limit(client):
+    # 两端读数 + 大 max_gap 覆盖整段，无需上报上万条读数
+    _ingest(client, "CASE-W1", [
+        _reading("CASE-W1", "2026-09-01T00:00:00Z", 20.0, 50.0),
+        _reading("CASE-W1", "2026-09-01T02:46:40Z", 24.0, 50.0),  # +10000s
+    ])
+    _ingest(client, "CASE-W2", [
+        _reading("CASE-W2", "2026-09-01T00:00:00Z", 21.0, 50.0),
+        _reading("CASE-W2", "2026-09-01T02:46:40Z", 25.0, 50.0),
+    ])
+    base = {
+        "source_sn": "CASE-W1", "target_sn": "CASE-W2", "dimension": "temperature",
+        "start": "2026-09-01T00:00:00Z", "end": "2026-09-01T02:46:40Z",
+        "step_seconds": 1, "max_lag_seconds": 0, "max_gap_seconds": 20000,
+    }
+    # 10001 点 > 10000：422 且 detail 带 limit/actual
+    r = client.get("/api/v1/propagation", params=base)
+    assert r.status_code == 422
+    detail = r.json()["detail"]
+    assert detail == {
+        "message": "重叠时段网格点数 10001 超过上限 10000",
+        "parameter": "grid_point_count", "limit": 10000, "actual": 10001,
+    }
+    # 缩短 1 秒：恰好 10000 点，可计算
+    r = client.get(
+        "/api/v1/propagation",
+        params={**base, "end": "2026-09-01T02:46:39Z"},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["grid_point_count"] == 10000
+
+
+def test_endpoint_lag_row_limit(client):
+    _ingest(client, "CASE-L1", _wave_readings("CASE-L1", 0))
+    _ingest(client, "CASE-L2", _wave_readings("CASE-L2", 0))
+    base = {
+        "source_sn": "CASE-L1", "target_sn": "CASE-L2", "dimension": "temperature",
+        "start": "2026-09-01T00:00:00Z", "end": "2026-09-01T00:11:00Z",
+        "step_seconds": 1, "max_gap_seconds": 600,
+    }
+    # 2*100+1 = 201 行：可计算
+    r = client.get("/api/v1/propagation", params={**base, "max_lag_seconds": 100})
+    assert r.status_code == 200, r.text
+    assert len(r.json()["lags"]) == 201
+    # 203 行：422
+    r = client.get("/api/v1/propagation", params={**base, "max_lag_seconds": 101})
+    assert r.status_code == 422
+    assert r.json()["detail"] == {
+        "message": "枚举时滞行数 203 超过上限 201",
+        "parameter": "lag_row_count", "limit": 201, "actual": 203,
+    }
+
+
+def test_endpoint_pair_work_limit(client):
+    _ingest(client, "CASE-P1", [
+        _reading("CASE-P1", "2026-09-01T00:00:00Z", 20.0, 50.0),
+        _reading("CASE-P1", "2026-09-01T02:13:20Z", 24.0, 50.0),  # +8000s
+    ])
+    _ingest(client, "CASE-P2", [
+        _reading("CASE-P2", "2026-09-01T00:00:00Z", 21.0, 50.0),
+        _reading("CASE-P2", "2026-09-01T02:13:20Z", 25.0, 50.0),
+    ])
+    base = {
+        "source_sn": "CASE-P1", "target_sn": "CASE-P2", "dimension": "temperature",
+        "start": "2026-09-01T00:00:00Z", "end": "2026-09-01T02:13:20Z",
+        "step_seconds": 1, "max_lag_seconds": 62, "max_gap_seconds": 20000,
+    }
+    # 8001 点 × 125 行 = 1,000,125 > 1,000,000：422
+    r = client.get("/api/v1/propagation", params=base)
+    assert r.status_code == 422
+    assert r.json()["detail"] == {
+        "message": "网格点数 × 时滞行数的配对工作量 1000125 超过上限 1000000",
+        "parameter": "pair_work", "limit": 1000000, "actual": 1000125,
+    }
+    # 缩短 1 秒：8000 × 125 = 恰好 1,000,000，可计算
+    r = client.get(
+        "/api/v1/propagation",
+        params={**base, "end": "2026-09-01T02:13:19Z"},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["grid_point_count"] == 8000
+    assert len(body["lags"]) == 125
+    # 原有语义不受影响：两柜都是线性斜坡，零时滞相关为 1
+    lag0 = next(l for l in body["lags"] if l["lag_seconds"] == 0.0)
+    assert lag0["correlation"] == pytest.approx(1.0, abs=1e-9)

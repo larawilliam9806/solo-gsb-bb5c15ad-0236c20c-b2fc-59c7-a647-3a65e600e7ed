@@ -16,6 +16,14 @@
 
 择优规则（依次）：相关绝对值更大 → 有效成对点数更多 → 时滞绝对值
 更小 → 时滞值更小。全部计算确定性，相同输入恒得相同输出。
+
+时间参数边界：``step_seconds`` / ``max_lag_seconds`` 先按微秒四舍五入
+取整为**生效值**，网格、时滞秒数与步长回显均使用该生效步长；非有限
+（NaN / ±inf）时间参数、或取整后为 0 的正步长（小于半微秒）抛
+:class:`PropagationParamsError`。在分配网格与时滞明细之前，按生效步长
+预估重叠网格点数（≤ 10000）、时滞行数（≤ 201）及两者乘积（配对
+工作量 ≤ 1 000 000），超限同样抛 :class:`PropagationParamsError`
+（接口层转为 422；恰好等于上限仍可计算）。
 """
 
 from __future__ import annotations
@@ -42,6 +50,33 @@ REASON_CONSTANT = "constant_series"  # 任一成对序列方差为 0
 
 # 皮尔逊相关最少成对点数
 MIN_PAIRS = 2
+
+# 资源上限：在分配网格与时滞明细之前按生效步长预估，超限抛
+# PropagationParamsError（接口层转 422）；恰好等于上限仍可计算
+MAX_GRID_POINTS = 10_000  # 重叠时段网格点数上限
+MAX_LAG_ROWS = 201  # 枚举时滞行数上限（2⌊max_lag/step⌋+1）
+MAX_PAIR_WORK = 1_000_000  # 网格点数 × 时滞行数（配对工作量）上限
+
+
+class PropagationParamsError(ValueError):
+    """传播分析时间参数非法或超出资源上限（接口层转为 422）。
+
+    ``parameter`` 指出触发拒绝的参数或限量维度；``limit`` / ``actual``
+    在超限场景给出上限值与分配前的实际预估值。
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        parameter: str,
+        limit: int | None = None,
+        actual: int | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.parameter = parameter
+        self.limit = limit
+        self.actual = actual
 
 
 class _SampleLike(Protocol):
@@ -125,14 +160,72 @@ def _interpolate_at(
     return v0 + (v1 - v0) * frac
 
 
-def _build_grid(start: dt.datetime, end: dt.datetime, step_seconds: float) -> list[dt.datetime]:
-    """从 ``start`` 起按固定步长生成不超过 ``end`` 的等距网格（含两端边界）。"""
+def normalize_time_params(
+    step_seconds: float, max_lag_seconds: float, max_gap_seconds: float
+) -> tuple[int, int]:
+    """校验时间参数并把步长 / 最大时滞统一到微秒精度。
+
+    返回 ``(step_us, max_lag_us)``——后续网格生成与时滞枚举的唯一依据
+    （生效步长）。拒绝条件（抛 :class:`PropagationParamsError`，接口层
+    转 422）：
+
+    - 任一参数非有限（NaN / ±inf）、步长非正、最大时滞为负、最大间隔非正；
+    - 正步长按微秒四舍五入取整后为 0（小于半微秒）——否则网格取整会除零。
+    """
+    for name, value in (
+        ("step_seconds", step_seconds),
+        ("max_lag_seconds", max_lag_seconds),
+        ("max_gap_seconds", max_gap_seconds),
+    ):
+        if not math.isfinite(value):
+            raise PropagationParamsError(
+                f"{name} 必须为有限数值（收到 {value!r}）", parameter=name
+            )
+    if step_seconds <= 0.0:
+        raise PropagationParamsError("step_seconds 必须为正", parameter="step_seconds")
+    if max_lag_seconds < 0.0:
+        raise PropagationParamsError(
+            "max_lag_seconds 必须非负", parameter="max_lag_seconds"
+        )
+    if max_gap_seconds <= 0.0:
+        raise PropagationParamsError(
+            "max_gap_seconds 必须为正", parameter="max_gap_seconds"
+        )
+    try:
+        step_us = int(round(step_seconds * 1_000_000))
+    except OverflowError:
+        raise PropagationParamsError(
+            "step_seconds 超出可表示范围", parameter="step_seconds"
+        ) from None
+    try:
+        max_lag_us = int(round(max_lag_seconds * 1_000_000))
+    except OverflowError:
+        raise PropagationParamsError(
+            "max_lag_seconds 超出可表示范围", parameter="max_lag_seconds"
+        ) from None
+    if step_us <= 0:
+        raise PropagationParamsError(
+            "step_seconds 取整到微秒后为 0（正步长不得小于半微秒）",
+            parameter="step_seconds",
+        )
+    return step_us, max_lag_us
+
+
+def _build_grid(start: dt.datetime, end: dt.datetime, step_us: int) -> list[dt.datetime]:
+    """从 ``start`` 起按固定微秒步长生成不超过 ``end`` 的等距网格（含两端边界）。"""
     if end < start:
         return []
-    step_us = int(round(step_seconds * 1_000_000))
     span_us = (end - start) // dt.timedelta(microseconds=1)
     n = span_us // step_us
     return [start + dt.timedelta(microseconds=step_us * k) for k in range(n + 1)]
+
+
+def _grid_point_count(start: dt.datetime, end: dt.datetime, step_us: int) -> int:
+    """不分配网格，仅计算将生成的网格点数（与 :func:`_build_grid` 同一公式）。"""
+    if end < start:
+        return 0
+    span_us = (end - start) // dt.timedelta(microseconds=1)
+    return span_us // step_us + 1
 
 
 def _series(
@@ -163,9 +256,40 @@ def _pearson(xs: list[float], ys: list[float]) -> tuple[float | None, str | None
     return r, None
 
 
-def _lag_range(max_lag_seconds: float, step_seconds: float) -> range:
+def _lag_row_count(max_lag_us: int, step_us: int) -> int:
+    """时滞枚举的行数：``2⌊max_lag/step⌋ + 1``（与 :func:`_lag_range` 同公式）。"""
+    return 2 * (max_lag_us // step_us) + 1
+
+
+def _check_limits(grid_point_count: int, lag_row_count: int) -> None:
+    """分配前的规模上限校验（按生效步长预估；恰好等于上限放行）。"""
+    if grid_point_count > MAX_GRID_POINTS:
+        raise PropagationParamsError(
+            f"重叠时段网格点数 {grid_point_count} 超过上限 {MAX_GRID_POINTS}",
+            parameter="grid_point_count",
+            limit=MAX_GRID_POINTS,
+            actual=grid_point_count,
+        )
+    if lag_row_count > MAX_LAG_ROWS:
+        raise PropagationParamsError(
+            f"枚举时滞行数 {lag_row_count} 超过上限 {MAX_LAG_ROWS}",
+            parameter="lag_row_count",
+            limit=MAX_LAG_ROWS,
+            actual=lag_row_count,
+        )
+    pair_work = grid_point_count * lag_row_count
+    if pair_work > MAX_PAIR_WORK:
+        raise PropagationParamsError(
+            f"网格点数 × 时滞行数的配对工作量 {pair_work} 超过上限 {MAX_PAIR_WORK}",
+            parameter="pair_work",
+            limit=MAX_PAIR_WORK,
+            actual=pair_work,
+        )
+
+
+def _lag_range(max_lag_us: int, step_us: int) -> range:
     """枚举 ±⌊max_lag / step⌋ 内的整数步（含 0）；max_lag < step 时仅 0。"""
-    kmax = int(math.floor(max_lag_seconds / step_seconds + 1e-9))
+    kmax = max_lag_us // step_us
     return range(-kmax, kmax + 1)
 
 
@@ -205,37 +329,56 @@ def compute_propagation(
     """计算两展柜在重叠时段上的分维时滞相关与传播方向。
 
     samples 无需预先排序；``start`` / ``end`` 已归一化为 UTC 且
-    ``start <= end``（由接口层校验）。
+    ``start <= end``（由接口层校验）。步长与最大时滞先经
+    :func:`normalize_time_params` 统一到微秒精度——网格、时滞秒数与
+    ``step_seconds`` 回显均使用该生效步长；非法时间参数或预估规模
+    超限（网格点数 / 时滞行数 / 配对工作量）抛
+    :class:`PropagationParamsError`，且在分配任何网格 / 明细之前抛出。
     """
+    step_us, max_lag_us = normalize_time_params(
+        step_seconds, max_lag_seconds, max_gap_seconds
+    )
+    effective_step_seconds = step_us / 1_000_000
+
     src_times, src_values = _series(source_samples, dimension)
     tgt_times, tgt_values = _series(target_samples, dimension)
 
     overlap_start = overlap_end = None
-    grid: list[dt.datetime] = []
-    source_grid: list[float | None] = []
-    target_grid: list[float | None] = []
+    planned_grid_points = 0
 
     if src_times and tgt_times:
         lo = max(start, src_times[0], tgt_times[0])
         hi = min(end, src_times[-1], tgt_times[-1])
         if lo <= hi:
             overlap_start, overlap_end = lo, hi
-            grid = _build_grid(lo, hi, step_seconds)
-            source_grid = [
-                _interpolate_at(src_times, src_values, t, max_gap_seconds)
-                for t in grid
-            ]
-            target_grid = [
-                _interpolate_at(tgt_times, tgt_values, t, max_gap_seconds)
-                for t in grid
-            ]
+            planned_grid_points = _grid_point_count(lo, hi, step_us)
+
+    # 分配前上限校验：时滞行数不依赖是否存在重叠（无重叠仍会生成全部明细），
+    # 故两项预估与配对工作量都在此处一次性校验
+    lag_row_count = _lag_row_count(max_lag_us, step_us)
+    _check_limits(planned_grid_points, lag_row_count)
+
+    grid: list[dt.datetime] = []
+    source_grid: list[float | None] = []
+    target_grid: list[float | None] = []
+    if overlap_start is not None and overlap_end is not None:
+        grid = _build_grid(overlap_start, overlap_end, step_us)
+        source_grid = [
+            _interpolate_at(src_times, src_values, t, max_gap_seconds)
+            for t in grid
+        ]
+        target_grid = [
+            _interpolate_at(tgt_times, tgt_values, t, max_gap_seconds)
+            for t in grid
+        ]
 
     # 网格等距：source[i] 与 target[i+k] 即 source(t) 与 target(t + k·step)；
     # 正时滞 k>0 表示 source 领先 target
     results: list[LagCorrelation] = []
     n = len(grid)
-    for k in _lag_range(max_lag_seconds, step_seconds):
-        lag_seconds = k * step_seconds
+    for k in _lag_range(max_lag_us, step_us):
+        # 先乘微秒整数再换秒：保证时滞为生效步长的精确整数倍
+        lag_seconds = (k * step_us) / 1_000_000
         xs: list[float] = []
         ys: list[float] = []
         if n:
@@ -279,7 +422,7 @@ def compute_propagation(
         end=end,
         overlap_start=overlap_start,
         overlap_end=overlap_end,
-        step_seconds=step_seconds,
+        step_seconds=effective_step_seconds,
         max_lag_seconds=max_lag_seconds,
         max_gap_seconds=max_gap_seconds,
         grid_point_count=n,

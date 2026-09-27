@@ -1005,7 +1005,9 @@ def build_propagation(
 
     任一展柜没有任何读数时返回 ``None``（由上层判 404）。两柜在查询窗内
     无重叠、或全部时滞样本不足/常量时，相关字段为 ``null``、方向为
-    ``unavailable``，不产生 NaN。
+    ``unavailable``，不产生 NaN。步长/时滞非法（非有限、正步长微秒取整
+    后为 0）或预估规模超限时抛 :class:`prop.PropagationParamsError`
+    （由上层转 422），且在分配网格 / 明细之前抛出。
     """
     source_samples = _load_samples(db, source_sn)
     target_samples = _load_samples(db, target_sn)
